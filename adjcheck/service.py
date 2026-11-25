@@ -22,10 +22,13 @@ from typing import Iterable, Sequence
 
 from .db import Database, StorageError
 from .geometry import (
+    COORD_MAX,
+    COORD_MIN,
     Rect,
     Region,
     analyze_rects,
     area_outside,
+    in_int64_range,
     merge_regions,
     subtract_rect,
     union_decompose,
@@ -53,11 +56,24 @@ class ValidationError(ValueError):
 
 
 def _parse_int(raw: str, label: str, reasons: list[str]) -> int | None:
+    """Parse one text coordinate, rejecting non-integers and out-of-int64 input.
+
+    Values outside the signed 64-bit metre range are reported with their
+    offending value and the allowed bounds instead of failing later inside
+    SQLite with a generic overflow error.
+    """
+
     try:
-        return int(raw.strip())
-    except (TypeError, ValueError):
+        value = int(raw.strip())
+    except (TypeError, ValueError, AttributeError):
         reasons.append(f"{label} 必须是整数米，收到 {raw!r}")
         return None
+    if not in_int64_range(value):
+        reasons.append(
+            f"{label}={value} 超出有符号 64 位整数米范围 [{COORD_MIN}, {COORD_MAX}]"
+        )
+        return None
+    return value
 
 
 def parse_extent(x0: str, y0: str, x1: str, y1: str) -> Rect:
@@ -72,8 +88,8 @@ def parse_extent(x0: str, y0: str, x1: str, y1: str) -> Rect:
         raise ValidationError(reasons)
     try:
         rect = Rect(*values)  # type: ignore[arg-type]
-    except ValueError:
-        raise ValidationError(["应交范围必须满足 x0<x1 且 y0<y1"])
+    except ValueError as exc:
+        raise ValidationError([str(exc)])
     if rect.width <= 0 or rect.height <= 0:
         raise ValidationError(["应交范围必须满足 x0<x1 且 y0<y1"])
     return rect
@@ -94,8 +110,8 @@ def parse_sheet_line(line: str, line_no: int) -> BatchEntry:
         raise ValidationError(reasons)
     try:
         rect = Rect(*ints)  # type: ignore[arg-type]
-    except ValueError:
-        raise ValidationError([f"第 {line_no} 行矩形必须满足 x0<x1 且 y0<y1: {line.strip()!r}"])
+    except ValueError as exc:
+        raise ValidationError([f"第 {line_no} 行：{exc}"])
     return BatchEntry(no, rect)
 
 
@@ -145,21 +161,51 @@ def parse_batch_json(payload: object) -> list[BatchEntry]:
         if no in seen:
             reasons.append(f"图幅号重复: {no}")
             continue
-        try:
-            rect = Rect(
-                int(item["x0"]),
-                int(item["y0"]),
-                int(item["x1"]),
-                int(item["y1"]),
+        coords = (item.get("x0"), item.get("y0"), item.get("x1"), item.get("y1"))
+        if any(type(v) is not int for v in coords):
+            reasons.append(
+                f"第 {index} 项坐标必须是整数（不接受小数、布尔值或字符串）"
             )
-        except (KeyError, TypeError, ValueError):
-            reasons.append(f"第 {index} 项坐标必须是满足 x0<x1、y0<y1 的整数")
+            continue
+        if any(not in_int64_range(v) for v in coords):
+            bad = ", ".join(
+                f"{name}={v}"
+                for name, v in zip(("x0", "y0", "x1", "y1"), coords)
+                if not in_int64_range(v)
+            )
+            reasons.append(
+                f"第 {index} 项坐标 {bad} 超出有符号 64 位整数米范围 "
+                f"[{COORD_MIN}, {COORD_MAX}]"
+            )
+            continue
+        try:
+            rect = Rect(*coords)
+        except ValueError as exc:
+            reasons.append(f"第 {index} 项：{exc}")
             continue
         seen.add(no)
         entries.append(BatchEntry(no, rect))
     if reasons:
         raise ValidationError(reasons)
     return entries
+
+
+def parse_version(raw: object) -> int | None:
+    """Strictly parse the optimistic-lock version field.
+
+    ``None``/empty means "no version supplied".  Booleans and floats are
+    rejected rather than silently coerced.  JSON callers must send an integer;
+    the no-JS HTML form can only submit text, so a plain decimal string is
+    accepted here and parsed exactly.
+    """
+
+    if raw is None or raw == "":
+        return None
+    if type(raw) is int:
+        return raw
+    if type(raw) is str and re.fullmatch(r"-?\d+", raw.strip()):
+        return int(raw.strip())
+    raise ValidationError(["version 必须是整数"])
 
 
 def validate_catalog(sheets: Sequence[Sheet]) -> None:
@@ -468,6 +514,17 @@ def ensure_demo(db: Database) -> None:
 
 
 # ------------------------------------------------------------------- display
+
+
+# Browsers parse SVG geometry as IEEE-754 doubles: above roughly 1e7 units a
+# 1-metre-wide rectangle cannot be drawn to the pixel anyway, and viewBoxes
+# near 2^63 are not reliably rendered.  The exact integer coordinates remain
+# available in the missing/overlap tables and JSON API regardless.
+SVG_MAX_SPAN = 10_000_000
+
+
+def svg_supported(extent: Rect) -> bool:
+    return extent.width <= SVG_MAX_SPAN and extent.height <= SVG_MAX_SPAN
 
 
 def svg_geometry(extent: Rect) -> dict[str, int]:

@@ -13,7 +13,7 @@
   <form method="post" action="{{ url_for('create') }}" class="grid-form">
     <label>项目名 <input name="name" required maxlength="60" placeholder="例如 DEMO-ADJ-001"></label>
     <fieldset>
-      <legend>应交范围（米）</legend>
+      <legend>应交范围（有符号 64 位整数米，范围 -9223372036854775808 ~ 9223372036854775807）</legend>
       <div class="inline">
         <label>x0 <input name="x0" required inputmode="numeric" placeholder="0"></label>
         <label>y0 <input name="y0" required inputmode="numeric" placeholder="0"></label>
@@ -21,7 +21,7 @@
         <label>y1 <input name="y1" required inputmode="numeric" placeholder="1000"></label>
       </div>
     </fieldset>
-    <label>图幅清单（每行：图幅号 x0 y0 x1 y1，最多 100 行）
+    <label>图幅清单（每行：图幅号 x0 y0 x1 y1，最多 100 行；坐标同样限有符号 64 位整数米）
       <textarea name="sheets" rows="7" required spellcheck="false"
         placeholder="S1 0 0 1000 1000&#10;S2 1100 0 2000 1000&#10;S3 900 0 1400 500"></textarea>
     </label>

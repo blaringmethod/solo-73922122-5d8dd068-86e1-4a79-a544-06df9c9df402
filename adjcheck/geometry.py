@@ -14,6 +14,35 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+# Coordinates are signed 64-bit integer metres.  SQLite stores INTEGER as a
+# signed 64-bit value, so anything outside this range cannot be persisted
+# losslessly and is rejected at every input boundary instead.
+COORD_MIN = -(2**63)
+COORD_MAX = 2**63 - 1
+
+
+def in_int64_range(value: int) -> bool:
+    return COORD_MIN <= value <= COORD_MAX
+
+
+def check_int64(value: int, label: str) -> int:
+    """Validate one coordinate value.
+
+    ``bool`` is rejected on purpose: ``True``/``False`` are ``int`` subclasses
+    in Python but never valid metre coordinates.  Areas are deliberately *not*
+    bounded: they are computed in Python arbitrary-precision integers and only
+    ever serialized as JSON text, so totals above 64 bits stay exact.
+    """
+
+    if type(value) is not int:
+        raise ValueError(f"{label} 必须是整数米，收到 {value!r}")
+    if not in_int64_range(value):
+        raise ValueError(
+            f"{label}={value} 超出有符号 64 位整数米范围 "
+            f"[{COORD_MIN}, {COORD_MAX}]"
+        )
+    return value
+
 
 @dataclass(frozen=True, order=True)
 class Rect:
@@ -25,6 +54,12 @@ class Rect:
     y1: int
 
     def __post_init__(self) -> None:
+        # Only the four stored coordinates are bounded by int64.  Width and
+        # height are differences of two in-range coordinates and may themselves
+        # reach 2^64-1; areas are likewise kept as Python big integers.
+        for label, value in (("x0", self.x0), ("y0", self.y0),
+                             ("x1", self.x1), ("y1", self.y1)):
+            check_int64(value, f"矩形坐标 {label}")
         if not (self.x0 < self.x1 and self.y0 < self.y1):
             raise ValueError(f"矩形必须满足 x0<x1 且 y0<y1: {self!r}")
 

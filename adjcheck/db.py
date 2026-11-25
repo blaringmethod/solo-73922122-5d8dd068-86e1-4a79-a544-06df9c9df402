@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator, Sequence
 
-from .geometry import Rect, Region
+from .geometry import COORD_MAX, COORD_MIN, Rect, Region
 from .models import CorrectionPlan, Issue, Project, Sheet
 
 
@@ -32,7 +32,17 @@ class CatalogProject:
     problem_area: int
 
 
-SCHEMA = """
+# Coordinates are signed 64-bit integer metres.  Areas are intentionally not
+# constrained: issue rectangles store coordinates only, and every area is
+# summed in Python (arbitrary precision), so totals above 2^63 stay exact.
+_COORD_CHECK = (
+    f"x0 BETWEEN {COORD_MIN} AND {COORD_MAX} AND "
+    f"y0 BETWEEN {COORD_MIN} AND {COORD_MAX} AND "
+    f"x1 BETWEEN {COORD_MIN} AND {COORD_MAX} AND "
+    f"y1 BETWEEN {COORD_MIN} AND {COORD_MAX}"
+)
+
+SCHEMA = f"""
 PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -45,6 +55,7 @@ CREATE TABLE IF NOT EXISTS projects (
     version     INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL,
+    CHECK ({_COORD_CHECK}),
     CHECK (x0 < x1 AND y0 < y1)
 );
 
@@ -58,6 +69,7 @@ CREATE TABLE IF NOT EXISTS sheets (
     y1          INTEGER NOT NULL,
     position    INTEGER NOT NULL,
     UNIQUE (project_id, no),
+    CHECK ({_COORD_CHECK}),
     CHECK (x0 < x1 AND y0 < y1)
 );
 
@@ -70,6 +82,7 @@ CREATE TABLE IF NOT EXISTS issues (
     x1          INTEGER NOT NULL,
     y1          INTEGER NOT NULL,
     sheet_ids   TEXT    NOT NULL DEFAULT '[]',
+    CHECK ({_COORD_CHECK}),
     CHECK (x0 < x1 AND y0 < y1),
     CHECK (kind <> 'overlap' OR json_array_length(sheet_ids) >= 2),
     CHECK (kind <> 'missing' OR json_array_length(sheet_ids) = 0)
@@ -165,26 +178,49 @@ class Database:
         return None if row is None else self._project_from_row(row)
 
     def list_catalog(self) -> list[CatalogProject]:
+        """Catalog rows with exact problem areas.
+
+        Areas are summed in Python rather than via SQL ``SUM((x1-x0)*...)``:
+        SQLite integer arithmetic raises "integer overflow" once a total
+        exceeds the signed 64-bit range, while a project's missing area may
+        legitimately be far larger than 2^63 m².  Stored coordinates stay
+        64-bit; only the displayed totals use Python big integers.
+        """
+
         with self.connection() as conn:
-            rows = conn.execute(
+            project_rows = conn.execute(
                 """
                 SELECT p.*,
-                       (SELECT COUNT(*) FROM sheets s WHERE s.project_id = p.id) AS sheet_count,
-                       (SELECT COUNT(*) FROM issues i WHERE i.project_id = p.id) AS issue_count,
-                       (SELECT COALESCE(SUM((i.x1-i.x0)*(i.y1-i.y0)), 0)
-                          FROM issues i WHERE i.project_id = p.id) AS problem_area
+                       (SELECT COUNT(*) FROM sheets s
+                         WHERE s.project_id = p.id) AS sheet_count
                   FROM projects p
                  ORDER BY p.name
                 """
             ).fetchall()
+            issue_rows = conn.execute(
+                """
+                SELECT i.project_id, i.x0, i.y0, i.x1, i.y1
+                  FROM issues i
+                 ORDER BY i.project_id, i.id
+                """
+            ).fetchall()
+        areas: dict[int, int] = {}
+        counts: dict[int, int] = {}
+        for row in issue_rows:
+            pid = row["project_id"]
+            counts[pid] = counts.get(pid, 0) + 1
+            areas[pid] = areas.get(pid, 0) + (row["x1"] - row["x0"]) * (
+                row["y1"] - row["y0"]
+            )
         result = []
-        for row in rows:
+        for row in project_rows:
+            pid = row["id"]
             result.append(
                 CatalogProject(
                     project=self._project_from_row(row),
                     sheet_count=row["sheet_count"],
-                    issue_count=row["issue_count"],
-                    problem_area=row["problem_area"],
+                    issue_count=counts.get(pid, 0),
+                    problem_area=areas.get(pid, 0),
                 )
             )
         return result

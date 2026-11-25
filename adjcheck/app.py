@@ -130,6 +130,7 @@ def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> F
             stats=stats,
             log=log,
             svg=service.svg_geometry(project.extent),
+            svg_supported=service.svg_supported(project.extent),
             sheet_boxes=[
                 {"no": s.no, "svg": service.svg_rect(s.rect, project.extent), "rect": s.rect}
                 for s in sheets
@@ -153,11 +154,7 @@ def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> F
 
     def _plan_from_request(project, sheets, issues, payload):
         batch = service.parse_batch_json(payload.get("batch"))
-        expected = payload.get("version")
-        try:
-            expected_version = int(expected) if expected not in (None, "") else None
-        except (TypeError, ValueError):
-            raise service.ValidationError(["version 必须是整数"])
+        expected_version = service.parse_version(payload.get("version"))
         return service.build_plan(
             project, sheets, issues, batch, expected_version=expected_version
         )
@@ -262,8 +259,8 @@ def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> F
         batch_text = request.form.get("batch", "")
         expected_raw = request.form.get("version", "").strip()
         try:
-            expected_version = int(expected_raw) if expected_raw else None
-        except ValueError:
+            expected_version = service.parse_version(expected_raw or None)
+        except service.ValidationError:
             flash("页面版本号无效，请刷新后重试", "error")
             return redirect(url_for("project_detail", name=name))
         try:

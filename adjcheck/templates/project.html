@@ -13,6 +13,7 @@
 
 <section class="card">
   <h2>覆盖示意</h2>
+  {% if svg_supported %}
   <svg viewBox="0 0 {{ svg.width }} {{ svg.height }}" class="map" preserveAspectRatio="xMidYMid meet"
        role="img" aria-label="图幅覆盖与问题区示意">
     <rect x="0" y="0" width="{{ svg.width }}" height="{{ svg.height }}" class="extent"></rect>
@@ -33,6 +34,10 @@
     <span class="key missing-key"></span> 缺片
     <span class="key overlap-key"></span> 重叠
   </p>
+  {% else %}
+  <p class="muted">应交范围跨度过大（&gt; {{ 10000000 }} 米），浏览器无法按比例准确绘制示意图；
+    精确坐标与面积以下方缺片区、重叠区表格及 JSON 接口为准（均为完整整数，不做舍入）。</p>
+  {% endif %}
 </section>
 
 <section class="card">
@@ -69,7 +74,8 @@
 <section class="card">
   <h2>批量更正（最多 4 张图幅）</h2>
   <p class="muted">整批替换后重新判定。更正必须消除一部分旧缺片或旧重叠，且不得让缺片或重叠出现在新的位置；
-    只重算本批新旧范围覆盖到的地方。</p>
+    只重算本批新旧范围覆盖到的地方。坐标为有符号 64 位整数米（-9223372036854775808 ~ 9223372036854775807），
+    页面全程按整数精确处理，不会因坐标过大而舍入；越界会在预检/提交时退回并说明原因，不改动目录与核查结果。</p>
   {% if demo_notes %}
     <ul class="notes">{% for note in demo_notes %}<li>{{ note }}</li>{% endfor %}</ul>
   {% endif %}

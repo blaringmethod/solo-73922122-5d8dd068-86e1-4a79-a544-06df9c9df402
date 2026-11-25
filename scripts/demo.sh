@@ -72,4 +72,112 @@ curl -sS -X POST "$BASE/api/projects/$PROJECT/apply" \
   -o /tmp/adjcheck_stale.json -w 'HTTP %{http_code}\n'
 python3 -c 'import json; print(json.load(open("/tmp/adjcheck_stale.json"))["message"])'
 
-say "演示完成：打开 $BASE/projects/$PROJECT 查看页面"
+# ---------------------------------------------------------------------------
+# 大坐标 / 超 64 位面积专项演示
+#
+# BIG-AREA：应交范围横跨整个有符号 64 位 x 轴、高 2 米，只覆盖高 1 米的一条，
+# 缺片面积 = 2^64-1 平方米（超过有符号 64 位整数上限）。旧实现的 SQL 求和会
+# 溢出报错或静默转浮点，这里目录首页与详情页都必须显示精确整数。
+# ---------------------------------------------------------------------------
+BIG=BIG-AREA
+X0=-9223372036854775808
+X1=9223372036854775807
+EXPECTED_AREA=18446744073709551615   # 2^64 - 1
+
+say "大坐标项目：创建缺片面积 2^64-1 m² 的项目 $BIG"
+curl -fsS -X POST "$BASE/projects" \
+  --data-urlencode "name=$BIG" \
+  --data-urlencode "x0=$X0" --data-urlencode "y0=0" \
+  --data-urlencode "x1=$X1" --data-urlencode "y1=2" \
+  --data-urlencode "sheets=S1 $X0 0 $X1 1" \
+  -o /dev/null -w 'create HTTP %{http_code}\n'
+
+say "目录首页（旧实现此处会 integer overflow；现在显示精确面积）"
+curl -fsS "$BASE/" | python3 -c 'import sys
+html = sys.stdin.read()
+needle = "18446744073709551615"
+assert needle in html, "首页缺少精确总面积"
+print("首页精确问题总面积:", needle, "m²")'
+
+say "项目详情与 JSON 状态：面积、坐标均为精确整数"
+curl -fsS "$BASE/api/projects/$BIG/state" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+area = d["stats"]["missing_area"]
+assert area == 18446744073709551615, area
+assert d["project"]["extent"] == [-9223372036854775808, 0, 9223372036854775807, 2]
+print("缺片面积:", area, "m²（精确，未转浮点）")
+print("应交范围:", d["project"]["extent"])'
+
+say "在负向极端坐标补掉恰好 1 m²（预检）"
+curl -fsS -X POST "$BASE/api/projects/$BIG/check" \
+  -H 'Content-Type: application/json' \
+  -d "{\"batch\":[{\"no\":\"S2\",\"x0\":$X0,\"y0\":1,\"x1\":$((X0+1)),\"y1\":2}],\"version\":0}" |
+  python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert d["accepted"], d["reasons"]
+assert d["eliminated"]["missing_area"] == 1
+assert d["after"]["missing_area"] == 18446744073709551614
+print("通过:", "；".join(d["reasons"]))
+print("消除缺片:", d["eliminated"]["missing_area"], "m²；更正后缺片:",
+      d["after"]["missing_area"], "m²（恰好减少 1）")'
+
+say "提交该 1 m² 更正并复核落库结果"
+curl -fsS -X POST "$BASE/api/projects/$BIG/apply" \
+  -H 'Content-Type: application/json' \
+  -d "{\"batch\":[{\"no\":\"S2\",\"x0\":$X0,\"y0\":1,\"x1\":$((X0+1)),\"y1\":2}],\"version\":0}" |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["applied"]; print("已写入:", d["message"])'
+curl -fsS "$BASE/api/projects/$BIG/state" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+s2 = next(s for s in d["sheets"] if s["no"] == "S2")
+assert s2["rect"] == [-9223372036854775808, 1, -9223372036854775807, 2], s2
+assert s2["rect"][2] - s2["rect"][0] == 1
+assert d["stats"]["missing_area"] == 18446744073709551614
+assert d["project"]["version"] == 1
+print("S2 落库坐标:", s2["rect"], "宽 =", s2["rect"][2] - s2["rect"][0], "米")
+print("更正后缺片总面积:", d["stats"]["missing_area"], "m²；版本 v", d["project"]["version"])'
+
+# BIG-PATCH：坐标在 2^53 之上，旧前端 Number 舍入会把 1 米宽补片存成 2 米。
+BASE_COORD=9007199254741000   # 2^53 之上的整数，相邻整数在 Number 下不可区分
+PATCH=BIG-PATCH
+
+say "大坐标补片项目 $PATCH：验证 1 米宽不被舍入成 2 米"
+curl -fsS -X POST "$BASE/projects" \
+  --data-urlencode "name=$PATCH" \
+  --data-urlencode "x0=$((BASE_COORD-10))" --data-urlencode "y0=0" \
+  --data-urlencode "x1=$((BASE_COORD+11))" --data-urlencode "y1=10" \
+  --data-urlencode "sheets=S1 $((BASE_COORD-10)) 0 $BASE_COORD 10
+S3 $((BASE_COORD+1)) 0 $((BASE_COORD+11)) 10" \
+  -o /dev/null -w 'create HTTP %{http_code}\n'
+curl -fsS "$BASE/api/projects/$PATCH/state" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+gap = d["issues"]
+assert len(gap) == 1 and gap[0]["rect"][2] - gap[0]["rect"][0] == 1, gap
+print("缝隙精确为 1 米宽:", gap[0]["rect"])'
+curl -fsS -X POST "$BASE/api/projects/$PATCH/apply" \
+  -H 'Content-Type: application/json' \
+  -d "{\"batch\":[{\"no\":\"S2\",\"x0\":$BASE_COORD,\"y0\":0,\"x1\":$((BASE_COORD+1)),\"y1\":10}],\"version\":0}" |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["applied"], d; print("1 米宽补片已提交:", d["message"])'
+curl -fsS "$BASE/api/projects/$PATCH/state" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+s2 = next(s for s in d["sheets"] if s["no"] == "S2")
+assert s2["rect"][2] - s2["rect"][0] == 1, s2
+assert d["stats"]["problem_area"] == 0
+print("S2 落库:", s2["rect"], "宽 =", s2["rect"][2]-s2["rect"][0], "米；问题总面积 =", d["stats"]["problem_area"])'
+
+say "越界坐标须提示原因且不改动数据"
+curl -sS -X POST "$BASE/api/projects/$PATCH/check" \
+  -H 'Content-Type: application/json' \
+  -d '{"batch":[{"no":"S2","x0":0,"y0":0,"x1":9223372036854775808,"y1":10}],"version":1}' \
+  -w '\nHTTP %{http_code}\n' | python3 -c 'import json,sys
+lines = sys.stdin.read().splitlines()
+status = lines[-1].split()[-1]
+payload = json.loads("\n".join(lines[:-1]))
+assert status == "400", status
+assert any("超出有符号 64 位" in r for r in payload["reasons"])
+print("HTTP 400：", payload["reasons"][0])'
+curl -fsS "$BASE/api/projects/$PATCH/state" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert d["project"]["version"] == 1 and d["stats"]["problem_area"] == 0
+print("越界预检后版本仍为 v1、目录与核查结果不变")'
+
+say "演示完成：打开 $BASE/ 查看目录，打开 $BASE/projects/$BIG 查看超 64 位面积详情"

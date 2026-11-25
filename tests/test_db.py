@@ -53,6 +53,83 @@ def test_schema_rejects_malformed_issue_rows(db):
         conn.execute("DELETE FROM issues")
 
 
+def test_schema_rejects_coordinates_outside_int64(db):
+    service.create_project(
+        db, "P", Rect(0, 0, 10, 10), [BatchEntry("A", Rect(0, 0, 10, 10))]
+    )
+    with db.connection() as conn:
+        project_id = conn.execute("SELECT id FROM projects").fetchone()[0]
+        # First line of defence: Python's sqlite3 module refuses to bind an
+        # integer outside the signed 64-bit range.
+        oversized = 2**63
+        with pytest.raises(OverflowError):
+            conn.execute(
+                "INSERT INTO sheets (project_id, no, x0, y0, x1, y1, position) "
+                "VALUES (?, 'Z', 0, 0, ?, 1, 0)",
+                (project_id, oversized),
+            )
+        with pytest.raises(OverflowError):
+            conn.execute(
+                "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
+                "VALUES (?, 'missing', 0, 0, ?, 1, '[]')",
+                (project_id, oversized),
+            )
+        # Second line of defence: the CHECK constraint rejects a bypassing write.
+        # The value is inlined as SQL text so no Python binding is involved.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO sheets (project_id, no, x0, y0, x1, y1, position) "
+                f"VALUES ({project_id}, 'Z', 0, 0, {oversized}, 1, 0)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
+                f"VALUES ({project_id}, 'missing', 0, 0, {oversized}, 1, '[]')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO projects (name, x0, y0, x1, y1, version, created_at, updated_at) "
+                f"VALUES ('X', 0, 0, {oversized}, 1, 0, '', '')"
+            )
+        # extreme but valid int64 coordinates are accepted
+        conn.execute(
+            "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
+            "VALUES (?, 'missing', ?, 0, ?, 1, '[]')",
+            (project_id, -(2**63), 2**63 - 1),
+        )
+
+
+def test_list_catalog_sums_areas_beyond_int64(tmp_path):
+    """The catalog page must not rely on SQL integer arithmetic for areas."""
+
+    database = Database(str(tmp_path / "big-catalog.sqlite3"))
+    database.init_schema()
+    service.create_project(
+        database,
+        "P",
+        Rect(-(2**63), 0, 2**63 - 1, 2),
+        [BatchEntry("A", Rect(-(2**63), 0, 2**63 - 1, 1))],
+    )
+    catalog = database.list_catalog()
+    assert len(catalog) == 1
+    expected = 2**64 - 1
+    assert catalog[0].problem_area == expected
+    assert catalog[0].problem_area > 2**63
+    # SQL integer arithmetic cannot represent this total: older SQLite raises
+    # "integer overflow"; newer versions silently degrade the result to a
+    # rounded float.  Either way it is inexact, which is why the catalog sums
+    # areas in Python instead.
+    with database.connection() as conn:
+        try:
+            sql_value = conn.execute(
+                "SELECT SUM((x1-x0)*(y1-y0)) FROM issues"
+            ).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            assert "overflow" in str(exc)
+        else:
+            assert sql_value != expected  # float rounding lost the exact value
+
+
 def test_sheet_numbers_are_unique_per_project(db):
     service.create_project(
         db, "P", Rect(0, 0, 10, 10), [BatchEntry("A", Rect(0, 0, 5, 5))]
